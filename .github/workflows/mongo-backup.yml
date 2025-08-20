@@ -1,0 +1,99 @@
+name: MongoDB Atlas → Google Drive Backup
+
+on:
+  schedule:
+    # Runs at 21:00 UTC daily (02:30 Asia/Colombo the next calendar day)
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+
+jobs:
+  backup:
+    name: Dump & Upload
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      # Required: Atlas connection string (srv or standard) with a read-only user
+      MONGO_URI: ${{ secrets.MONGO_URI }}
+      # Optional: if set, dump a single DB instead of all
+      MONGO_DB: ${{ secrets.MONGO_DB }}
+      # Optional: Google Drive destination (defaults to gdrive:Backups/Mongo if not set)
+      DRIVE_PATH: ${{ secrets.DRIVE_PATH }}
+
+      # Retention in days for Drive (and local temp cleanup)
+      RETENTION_DAYS: ${{ secrets.RETENTION_DAYS }}
+      # Default to 14 if not provided
+      RETENTION_DAYS_DEFAULT: "14"
+
+    steps:
+      - name: Sanity check secrets
+        run: |
+          test -n "$MONGO_URI" || (echo "Missing secret MONGO_URI" && exit 1)
+
+      - name: Install MongoDB Database Tools (mongodump/mongorestore)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mongodb-database-tools
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone (Google Drive)
+        shell: bash
+        env:
+          RCLONE_TOKEN: ${{ secrets.RCLONE_TOKEN }}
+        run: |
+          mkdir -p ~/.config/rclone
+          # Create a minimal rclone.conf using the token JSON from the secret
+          cat > ~/.config/rclone/rclone.conf <<'EOF'
+          [gdrive]
+          type = drive
+          token = ${RCLONE_TOKEN}
+          EOF
+          # Basic check (won't fail build if Drive is empty)
+          rclone lsd gdrive: || true
+
+      - name: Dump MongoDB and upload to Drive
+        shell: bash
+        run: |
+          set -euo pipefail
+          TS=$(date +'%Y-%m-%dT%H-%M-%S')
+          WORKDIR="work/${TS}"
+          mkdir -p "$WORKDIR"
+
+          # If MONGO_DB is provided, dump that DB. Else dump all.
+          if [ -n "${MONGO_DB:-}" ]; then
+            echo "Dumping single DB: ${MONGO_DB}"
+            mongodump --uri="${MONGO_URI}/${MONGO_DB}" --out "$WORKDIR" --gzip
+          else
+            echo "Dumping ALL databases from URI"
+            mongodump --uri="${MONGO_URI}" --out "$WORKDIR" --gzip
+          fi
+
+          ARCHIVE="mongo-backup-${TS}.tar.gz"
+          tar -C "$WORKDIR" -czf "$ARCHIVE" .
+
+          DEST="${DRIVE_PATH:-gdrive:Backups/Mongo}"
+          echo "Uploading to ${DEST}..."
+          rclone copy "$ARCHIVE" "$DEST" --transfers=4 --checkers=8 --fast-list
+
+          # Retention (Drive)
+          RD="${RETENTION_DAYS:-${RETENTION_DAYS_DEFAULT}}"
+          echo "Applying retention: ${RD} days on Drive"
+          rclone delete --min-age ${RD}d "$DEST" || true
+          rclone rmdirs "$DEST" --leave-root || true
+
+          # Cleanup local
+          rm -rf work
+          rm -f "$ARCHIVE"
+
+      - name: (Optional) Keep a 7-day copy as workflow artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: last-backup
+          path: "*.tar.gz"
+          if-no-files-found: ignore
+          retention-days: 7
